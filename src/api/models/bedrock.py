@@ -3,6 +3,7 @@ import json
 import logging
 import re
 import time
+import os
 from abc import ABC
 from typing import AsyncIterable, Iterable, Literal
 
@@ -36,29 +37,52 @@ from api.schema import (
     EmbeddingsResponse,
     EmbeddingsUsage,
     Embedding,
-
 )
 from api.setting import DEBUG, AWS_REGION, ENABLE_CROSS_REGION_INFERENCE, DEFAULT_MODEL
+from api.aws.session_manager import AWSSessionManager
 
 logger = logging.getLogger(__name__)
 
 config = Config(connect_timeout=60, read_timeout=120, retries={"max_attempts": 1})
 
-bedrock_runtime = boto3.client(
-    service_name="bedrock-runtime",
-    region_name=AWS_REGION,
-    config=config,
+session_manager = AWSSessionManager(
+    os.environ.get("CREDS"),
+    os.environ.get("ROLE_ARN"),
+    os.environ.get("ROLE_SESSION_NAME"),
 )
-bedrock_client = boto3.client(
-    service_name='bedrock',
-    region_name=AWS_REGION,
-    config=config,
-)
+
+
+def get_bedrock_runtime():
+    if session_manager.use_session_manager():
+        session = session_manager.get_session()
+        method = session.client
+    else:
+        method = boto3.client
+
+    return method(
+        service_name="bedrock-runtime",
+        region_name=AWS_REGION,
+        config=config,
+    )
+
+
+def get_bedrock_client():
+    if session_manager.use_session_manager():
+        session = session_manager.get_session()
+        method = session.client
+    else:
+        method = boto3.client
+
+    return method(
+        service_name="bedrock",
+        region_name=AWS_REGION,
+        config=config,
+    )
 
 
 def get_inference_region_prefix():
-    if AWS_REGION.startswith('ap-'):
-        return 'apac'
+    if AWS_REGION.startswith("ap-"):
+        return "apac"
     return AWS_REGION[:2]
 
 
@@ -86,51 +110,45 @@ def list_bedrock_models() -> dict:
     model_list = {}
     try:
         profile_list = []
+        bedrock_client = get_bedrock_client()
         if ENABLE_CROSS_REGION_INFERENCE:
             # List system defined inference profile IDs
             response = bedrock_client.list_inference_profiles(
-                maxResults=1000,
-                typeEquals='SYSTEM_DEFINED'
+                maxResults=1000, typeEquals="SYSTEM_DEFINED"
             )
-            profile_list = [p['inferenceProfileId'] for p in response['inferenceProfileSummaries']]
+            profile_list = [
+                p["inferenceProfileId"] for p in response["inferenceProfileSummaries"]
+            ]
 
         # List foundation models, only cares about text outputs here.
-        response = bedrock_client.list_foundation_models(
-            byOutputModality='TEXT'
-        )
+        response = bedrock_client.list_foundation_models(byOutputModality="TEXT")
 
-        for model in response['modelSummaries']:
-            model_id = model.get('modelId', 'N/A')
-            stream_supported = model.get('responseStreamingSupported', True)
-            status = model['modelLifecycle'].get('status', 'ACTIVE')
+        for model in response["modelSummaries"]:
+            model_id = model.get("modelId", "N/A")
+            stream_supported = model.get("responseStreamingSupported", True)
+            status = model["modelLifecycle"].get("status", "ACTIVE")
 
             # currently, use this to filter out rerank models and legacy models
-            if not stream_supported or status not in ["ACTIVE", "LEGACY"]:
+            if not stream_supported or status != "ACTIVE":
                 continue
 
-            inference_types = model.get('inferenceTypesSupported', [])
-            input_modalities = model['inputModalities']
+            inference_types = model.get("inferenceTypesSupported", [])
+            input_modalities = model["inputModalities"]
             # Add on-demand model list
-            if 'ON_DEMAND' in inference_types:
-                model_list[model_id] = {
-                    'modalities': input_modalities
-                }
+            if "ON_DEMAND" in inference_types:
+                model_list[model_id] = {"modalities": input_modalities}
 
             # Add cross-region inference model list.
-            profile_id = cr_inference_prefix + '.' + model_id
+            profile_id = cr_inference_prefix + "." + model_id
             if profile_id in profile_list:
-                model_list[profile_id] = {
-                    'modalities': input_modalities
-                }
+                model_list[profile_id] = {"modalities": input_modalities}
 
     except Exception as e:
         logger.error(f"Unable to list models: {str(e)}")
 
     if not model_list:
         # In case stack not updated.
-        model_list[DEFAULT_MODEL] = {
-            'modalities': ["TEXT", "IMAGE"]
-        }
+        model_list[DEFAULT_MODEL] = {"modalities": ["TEXT", "IMAGE"]}
 
     return model_list
 
@@ -169,6 +187,8 @@ class BedrockModel(BaseChatModel):
         args = self._parse_request(chat_request)
         if DEBUG:
             logger.info("Bedrock request: " + json.dumps(str(args)))
+
+        bedrock_runtime = get_bedrock_runtime()
 
         try:
             if stream:
@@ -223,8 +243,8 @@ class BedrockModel(BaseChatModel):
             if stream_response.choices:
                 yield self.stream_response_to_bytes(stream_response)
             elif (
-                    chat_request.stream_options
-                    and chat_request.stream_options.include_usage
+                chat_request.stream_options
+                and chat_request.stream_options.include_usage
             ):
                 # An empty choices for Usage as per OpenAI doc below:
                 # if you set stream_options: {"include_usage": true}.
@@ -302,7 +322,7 @@ class BedrockModel(BaseChatModel):
                                     "toolUse": {
                                         "toolUseId": message.tool_calls[0].id,
                                         "name": message.tool_calls[0].function.name,
-                                        "input": tool_input
+                                        "input": tool_input,
                                     }
                                 }
                             ],
@@ -332,7 +352,7 @@ class BedrockModel(BaseChatModel):
         return self._reframe_multi_payloard(messages)
 
     def _reframe_multi_payloard(self, messages: list) -> list:
-        """ Receive messages and reformat them to comply with the Claude format
+        """Receive messages and reformat them to comply with the Claude format
 
         With OpenAI format requests, it's not a problem to repeatedly receive messages from the same role, but
         with Claude format requests, you cannot repeatedly receive messages from the same role.
@@ -361,16 +381,15 @@ class BedrockModel(BaseChatModel):
 
         # Search through the list of messages and combine messages from the same role into one list
         for message in messages:
-            next_role = message['role']
-            next_content = message['content']
+            next_role = message["role"]
+            next_content = message["content"]
 
             # If the next role is different from the previous message, add the previous role's messages to the list
             if next_role != current_role:
                 if current_content:
-                    reformatted_messages.append({
-                        "role": current_role,
-                        "content": current_content
-                    })
+                    reformatted_messages.append(
+                        {"role": current_role, "content": current_content}
+                    )
                 # Switch to the new role
                 current_role = next_role
                 current_content = []
@@ -383,10 +402,9 @@ class BedrockModel(BaseChatModel):
 
         # Add the last role's messages to the list
         if current_content:
-            reformatted_messages.append({
-                "role": current_role,
-                "content": current_content
-            })
+            reformatted_messages.append(
+                {"role": current_role, "content": current_content}
+            )
 
         return reformatted_messages
 
@@ -428,7 +446,9 @@ class BedrockModel(BaseChatModel):
                 ]
             }
 
-            if chat_request.tool_choice and not chat_request.model.startswith("meta.llama3-1-"):
+            if chat_request.tool_choice and not chat_request.model.startswith(
+                "meta.llama3-1-"
+            ):
                 if isinstance(chat_request.tool_choice, str):
                     # auto (default) is mapped to {"auto" : {}}
                     # required is mapped to {"any" : {}}
@@ -440,17 +460,20 @@ class BedrockModel(BaseChatModel):
                     # Specific tool to use
                     assert "function" in chat_request.tool_choice
                     args["toolConfig"]["toolChoice"] = {
-                        "tool": {"name": chat_request.tool_choice["function"].get("name", "")}}
+                        "tool": {
+                            "name": chat_request.tool_choice["function"].get("name", "")
+                        }
+                    }
         return args
 
     def _create_response(
-            self,
-            model: str,
-            message_id: str,
-            content: list[dict] = None,
-            finish_reason: str | None = None,
-            input_tokens: int = 0,
-            output_tokens: int = 0,
+        self,
+        model: str,
+        message_id: str,
+        content: list[dict] = None,
+        finish_reason: str | None = None,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
     ) -> ChatResponse:
 
         message = ChatResponseMessage(
@@ -502,7 +525,7 @@ class BedrockModel(BaseChatModel):
         return response
 
     def _create_response_stream(
-            self, model_id: str, message_id: str, chunk: dict
+        self, model_id: str, message_id: str, chunk: dict
     ) -> ChatStreamResponse | None:
         """Parsing the Bedrock stream response chunk.
 
@@ -554,7 +577,7 @@ class BedrockModel(BaseChatModel):
                             index=index,
                             function=ResponseFunction(
                                 arguments=delta["toolUse"]["input"],
-                            )
+                            ),
                         )
                     ]
                 )
@@ -625,9 +648,9 @@ class BedrockModel(BaseChatModel):
             )
 
     def _parse_content_parts(
-            self,
-            message: UserMessage,
-            model_id: str,
+        self,
+        message: UserMessage,
+        model_id: str,
     ) -> list[dict]:
         if isinstance(message.content, str):
             return [
@@ -666,7 +689,7 @@ class BedrockModel(BaseChatModel):
     @staticmethod
     def is_supported_modality(model_id: str, modality: str = "IMAGE") -> bool:
         model = bedrock_model_list.get(model_id)
-        modalities = model.get('modalities', [])
+        modalities = model.get("modalities", [])
         if modality in modalities:
             return True
         return False
@@ -699,9 +722,11 @@ class BedrockModel(BaseChatModel):
                 "max_tokens": "length",
                 "stop_sequence": "stop",
                 "complete": "stop",
-                "content_filtered": "content_filter"
+                "content_filtered": "content_filter",
             }
-            return finish_reason_mapping.get(finish_reason.lower(), finish_reason.lower())
+            return finish_reason_mapping.get(
+                finish_reason.lower(), finish_reason.lower()
+            )
         return None
 
 
@@ -714,6 +739,8 @@ class BedrockEmbeddingsModel(BaseEmbeddingsModel, ABC):
         if DEBUG:
             logger.info("Invoke Bedrock Model: " + model_id)
             logger.info("Bedrock request body: " + body)
+
+        bedrock_runtime = get_bedrock_runtime()
         try:
             return bedrock_runtime.invoke_model(
                 body=body,
@@ -729,12 +756,12 @@ class BedrockEmbeddingsModel(BaseEmbeddingsModel, ABC):
             raise HTTPException(status_code=500, detail=str(e))
 
     def _create_response(
-            self,
-            embeddings: list[float],
-            model: str,
-            input_tokens: int = 0,
-            output_tokens: int = 0,
-            encoding_format: Literal["float", "base64"] = "float",
+        self,
+        embeddings: list[float],
+        model: str,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        encoding_format: Literal["float", "base64"] = "float",
     ) -> EmbeddingsResponse:
         data = []
         for i, embedding in enumerate(embeddings):
@@ -810,8 +837,8 @@ class TitanEmbeddingsModel(BedrockEmbeddingsModel):
         if isinstance(embeddings_request.input, str):
             input_text = embeddings_request.input
         elif (
-                isinstance(embeddings_request.input, list)
-                and len(embeddings_request.input) == 1
+            isinstance(embeddings_request.input, list)
+            and len(embeddings_request.input) == 1
         ):
             input_text = embeddings_request.input[0]
         else:
