@@ -8,23 +8,20 @@ logger = logging.getLogger(__name__)
 
 class AWSSessionManager:
     def __init__(self, creds_json, role_arn, role_session_name, duration_seconds=3600):
-        if creds_json:
-            logger.info("Using Session Manager")
-        else:
-            logger.info("Disabling Session Manager")
+        self.session = None
+        self.refresh_time = 0
+
+        if not creds_json:
+            logger.warning("Disabling Session Manager")
             return
 
         self.creds_json = json.loads(creds_json)
         self.role_arn = role_arn
         self.role_session_name = role_session_name
         self.duration_seconds = duration_seconds
-        self.session = None
-        self.refresh_time = 0
 
     def use_session_manager(self) -> bool:
-        if self.creds_json:
-            return True
-        return False
+        return hasattr(self, "creds_json") and self.creds_json is not None
 
     def get_session(self):
         current_time = time.time()
