@@ -4,6 +4,8 @@
 
 OpenAI-compatible RESTful APIs for Amazon Bedrock
 
+Public Docker Images are available at https://hub.docker.com/repository/docker/kpbitgo/bedrock-access-gateway
+
 ## Breaking Changes
 
 This solution now uses Secrets Manager to maintain API Key for security best practice.  You **MUST** create the API Key first in Secrets Manager and rotate it frequently.
