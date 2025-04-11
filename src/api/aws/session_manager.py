@@ -2,6 +2,7 @@ import json
 import time
 import boto3
 import logging
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,33 @@ class AWSSessionManager:
 
     def use_session_manager(self) -> bool:
         return hasattr(self, "creds_json") and self.creds_json is not None
+
+    def is_creds_expired(self) -> bool:
+        if not self.use_session_manager():
+            return False
+
+        try:
+            # Parse expiration time from creds_json
+            expiration_str = self.creds_json.get("Expiration")
+            if not expiration_str:
+                logger.warning("No expiration time found in credentials")
+                return True
+
+            # Parse ISO format datetime string
+            expiration_time = datetime.fromisoformat(
+                expiration_str.replace("Z", "+00:00")
+            )
+
+            # Convert to timestamp for comparison
+            expiration_timestamp = expiration_time.timestamp()
+            current_time = time.time()
+
+            # Check if expired
+            return current_time >= expiration_timestamp
+
+        except Exception as e:
+            logger.error(f"Error checking credential expiration: {e}")
+            return True
 
     def get_session(self):
         current_time = time.time()

@@ -39,17 +39,11 @@ from api.schema import (
     Embedding,
 )
 from api.setting import DEBUG, AWS_REGION, ENABLE_CROSS_REGION_INFERENCE, DEFAULT_MODEL
-from api.aws.session_manager import AWSSessionManager
+from api.auth import aws_session_manager as session_manager
 
 logger = logging.getLogger(__name__)
 
 config = Config(connect_timeout=60, read_timeout=120, retries={"max_attempts": 1})
-
-session_manager = AWSSessionManager(
-    os.environ.get("CREDS"),
-    os.environ.get("ROLE_ARN"),
-    os.environ.get("ROLE_SESSION_NAME"),
-)
 
 
 def get_bedrock_runtime():

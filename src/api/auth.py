@@ -2,12 +2,20 @@ import json
 import os
 from typing import Annotated
 
+from starlette.responses import JSONResponse
+
+from api.aws.session_manager import AWSSessionManager
 import boto3
 from botocore.exceptions import ClientError
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from api.setting import DEFAULT_API_KEYS
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 api_key_param = os.environ.get("API_KEY_PARAM_NAME")
 api_key_secret_arn = os.environ.get("API_KEY_SECRET_ARN")
@@ -48,3 +56,36 @@ def api_key_auth(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API Key"
         )
+
+
+aws_session_manager = AWSSessionManager(
+    os.environ.get("CREDS"),
+    os.environ.get("ROLE_ARN"),
+    os.environ.get("ROLE_SESSION_NAME"),
+)
+
+
+class AWSCredentailsMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app: FastAPI, session_manager: AWSSessionManager):
+        super().__init__(app)
+        self.session_manager = session_manager
+
+    async def dispatch(self, request: Request, call_next):
+        # Skip credential check for certain paths if needed
+        if request.url.path in [
+            "/health",
+            "/metrics",
+            "/docs",
+            "/redoc",
+            "/openapi.json",
+        ]:
+            return await call_next(request)
+
+        if self.session_manager.is_creds_expired():
+            logger.warning("Request denied due to expired AWS credentials")
+            return JSONResponse(
+                status_code=403,
+                content={"error": {"message": "AWS credentials have expired"}},
+            )
+
+        return await call_next(request)
